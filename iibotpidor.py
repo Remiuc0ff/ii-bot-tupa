@@ -7,11 +7,11 @@ from .. import loader, utils
 class GeniusMod(loader.Module):
     strings = {
         "name": "iibot",
-        "pref": "<b>[Гениус]</b> ",
+        "pref": "<b>[iibot]</b> ",
         "need_arg": "{}Нужен аргумент",
         "status": "{}Шанс ответа теперь 1 к {}",
-        "on": "{}Гений в этом чате включён",
-        "off": "{}Гений в этом чате выключен",
+        "on": "{}ii в этом чате включён",
+        "off": "{}ii в этом чате выключен",
     }
     _db_name = "Genius"
 
