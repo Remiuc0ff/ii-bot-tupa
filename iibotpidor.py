@@ -3,21 +3,10 @@ import re
 from telethon import types
 from .. import loader, utils
 
-#
-# ░█░█░█▀▀░█▀█░█▀▀░▀█▀░█▀▄░█▀▀
-# ░▄▀▄░█▀▀░█░█░▀▀█░░█░░█░█░█▀▀
-# ░▀░▀░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀▀░░▀▀▀
-#
-# 🔒 Licensed under the AGPL-3.0
-# 🥱 Im not allowing to edit this module.
-# 🌐 https://www.gnu.org/licenses/agpl-3.0.html
-# meta developer: @XenSideMOD
-#
-
 @loader.tds
 class GeniusMod(loader.Module):
     strings = {
-        "name": "Гениус",
+        "name": "iibot",
         "pref": "<b>[Гениус]</b> ",
         "need_arg": "{}Нужен аргумент",
         "status": "{}Шанс ответа теперь 1 к {}",
@@ -133,7 +122,7 @@ class GeniusMod(loader.Module):
             cleaned_text = re.sub(url_pattern, '', text_without_hyperlinks).strip()
 
             if cleaned_text:
-                # ВОТ ЭТО ЭТО НАХУЙ БАЙПАСС БАНА ССЫЛОК
+            
                 final_text = cleaned_text.replace(".", "⁣.⁣")
                 await m.reply(final_text)
 
