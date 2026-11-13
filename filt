@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+from datetime import datetime, timezone, timedelta
 from telethon import events
 from telethon.tl.types import Message
 from .. import loader, utils
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 @loader.tds
 class BotAutomatorMod(loader.Module):
-    """Пошаговая цикличная автоматизация действий и кнопок в ботах"""
+    """Пошаговая цикличная автоматизация действий и кнопок в ботах + автоочистка сообщений"""
 
     strings = {
         "name": "BotAutomator",
@@ -22,6 +23,7 @@ class BotAutomatorMod(loader.Module):
         "cfg_trigger": "Текст от бота о полном завершении (перезапуск цикла)",
         "cfg_delay": "Задержка между нажатиями кнопок (в секундах)",
         "cfg_step_delay": "Задержка перед отправкой 2-го сообщения и новым кругом (в секундах)",
+        "cfg_cleanup_enabled": "Включить автоматическое удаление свежих сообщений (< 10 часов)",
         "no_bot": "❌ <b>Целевой бот не настроен в конфиге!</b> Используй <code>.config BotAutomator</code>",
         "no_text": "❌ <b>Текст для отправки не задан!</b> Укажи его через <code>.btext &lt;текст&gt;</code> или сразу <code>.bstart &lt;текст&gt;</code>",
         "text_set": "✅ <b>Текст для цикла сохранен:</b>\n<code>{}</code>",
@@ -31,7 +33,8 @@ class BotAutomatorMod(loader.Module):
             "🤖 <b>Бот:</b> <code>{}</code> (ID: <code>{}</code>)\n"
             "💬 <b>Текст (по 2 подхода):</b> <code>{}</code>\n"
             "🔘 <b>Очередь кнопок:</b> <code>{}</code>\n"
-            "🎯 <b>Триггер нового круга:</b> <code>{}</code>"
+            "🎯 <b>Триггер нового круга:</b> <code>{}</code>\n"
+            "🧹 <b>Автоочистка (<10ч, раз в час):</b> <code>{}</code>"
         ),
         "stopped": "🛑 <b>Автоматизация остановлена.</b>",
         "not_running": "ℹ️ <b>Автоматизация сейчас не работает.</b>",
@@ -70,10 +73,17 @@ class BotAutomatorMod(loader.Module):
                 lambda: self.strings["cfg_step_delay"],
                 validator=loader.validators.Float(minimum=0.5),
             ),
+            loader.ConfigValue(
+                "cleanup_enabled",
+                True,
+                lambda: self.strings["cfg_cleanup_enabled"],
+                validator=loader.validators.Boolean(),
+            ),
         )
         self.running = False
         self.target_id = None
         self.loop_task = None
+        self.cleanup_task = None
         self.sub_step_done = asyncio.Event()
         self.cycle_done = asyncio.Event()
         self._click_lock = asyncio.Lock()
@@ -94,6 +104,8 @@ class BotAutomatorMod(loader.Module):
         self.running = False
         if self.loop_task:
             self.loop_task.cancel()
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
         self._client.remove_event_handler(
             self._on_message_edited,
             events.MessageEdited(incoming=True),
@@ -164,6 +176,9 @@ class BotAutomatorMod(loader.Module):
         self.sub_step_done.clear()
         self.cycle_done.clear()
         self.loop_task = asyncio.create_task(self._runner_loop())
+        
+        if self.config["cleanup_enabled"]:
+            self.cleanup_task = asyncio.create_task(self._cleanup_loop())
 
         buttons_str = (
             " ➔ ".join(self.config["buttons"])
@@ -178,6 +193,7 @@ class BotAutomatorMod(loader.Module):
                 utils.escape_html(spam_text),
                 utils.escape_html(buttons_str),
                 utils.escape_html(self.config["done_trigger"]),
+                "Включена" if self.config["cleanup_enabled"] else "Выключена",
             ),
         )
 
@@ -194,6 +210,9 @@ class BotAutomatorMod(loader.Module):
         if self.loop_task:
             self.loop_task.cancel()
             self.loop_task = None
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
+            self.cleanup_task = None
 
         await utils.answer(message, self.strings["stopped"])
 
@@ -209,7 +228,6 @@ class BotAutomatorMod(loader.Module):
                     if str(b).strip()
                 ]
 
-                # 2 подхода подряд: (сообщение -> все кнопки по очереди) x2
                 for step in range(2):
                     if not self.running:
                         return
@@ -234,7 +252,6 @@ class BotAutomatorMod(loader.Module):
                     if step == 0:
                         await asyncio.sleep(step_delay)
 
-                # Ждем финальное сообщение "✅ Готово"
                 await self.cycle_done.wait()
 
                 if not self.running:
@@ -248,21 +265,55 @@ class BotAutomatorMod(loader.Module):
             logger.error(f"[BotAutomator] Ошибка в цикле: {e}")
             self.running = False
 
+    async def _cleanup_loop(self):
+        """Фоновая задача: удаляет сообщения моложе 10 часов каждый 1 час"""
+        try:
+            # Небольшая пауза при старте, чтобы не спамить запросами сразу
+            await asyncio.sleep(10)
+            while self.running:
+                if self.target_id:
+                    try:
+                        now = datetime.now(timezone.utc)
+                        threshold = now - timedelta(hours=10)
+                        messages_to_delete = []
+
+                        async for msg in self._client.iter_messages(self.target_id, limit=100):
+                            if msg.date:
+                                # Если дата сообщения позже порога (т.е. оно создано менее 10 часов назад)
+                                if msg.date > threshold:
+                                    messages_to_delete.append(msg.id)
+                                else:
+                                    # Так как итератор идет от новых к старым, как только встретили сообщение старше 10 часов,
+                                    # все следующие будут еще старше. Но проверим и более старые на всякий случай или остановим?
+                                    # Оставим проверку всех в пределах лимита на случай разброса, либо просто фильтруем.
+                                    pass
+
+                        if messages_to_delete:
+                            # Удаляем пачками по 100 штук (Telegram лимит)
+                            for i in range(0, len(messages_to_delete), 100):
+                                chunk = messages_to_delete[i:i+100]
+                                await self._client.delete_messages(self.target_id, chunk)
+                                await asyncio.sleep(0.5)
+                    except Exception as e:
+                        logger.debug(f"[BotAutomator] Ошибка автоочистки: {e}")
+
+                # Ждем ровно 1 час перед следующей чисткой
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+
     def _find_button(self, message: Message, target_text: str):
-        """Ищет кнопку в сообщении (сначала точное совпадение, затем частичное)"""
         if not getattr(message, "buttons", None):
             return None
 
         target_lower = target_text.lower()
 
-        # 1. Ищем точное совпадение или совпадение с точкой "• 5"
         for row in message.buttons:
             for btn in row:
                 b_text = (getattr(btn, "text", "") or "").strip().lower()
                 if b_text == target_lower or b_text == f"• {target_lower}":
                     return btn
 
-        # 2. Ищем вхождение (например, "Запустить" внутри "🚀 Запустить")
         for row in message.buttons:
             for btn in row:
                 b_text = (getattr(btn, "text", "") or "").strip().lower()
@@ -286,18 +337,15 @@ class BotAutomatorMod(loader.Module):
         text = getattr(message, "raw_text", "") or ""
         trigger = str(self.config["done_trigger"]).strip()
 
-        # 1. Проверяем финальный триггер ("✅ Готово")
         if trigger and trigger.lower() in text.lower():
             self.cycle_done.set()
 
-        # 2. Сохраняем актуальное сообщение с кнопками и запускаем последовательный кликер
         if getattr(message, "buttons", None):
             self._last_bot_msg = message
             if not self._click_lock.locked():
                 asyncio.create_task(self._process_buttons_queue())
 
     async def _process_buttons_queue(self):
-        """Последовательно нажимает кнопки из конфига в одном или нескольких сообщениях"""
         async with self._click_lock:
             target_buttons = [
                 str(b).strip()
@@ -310,7 +358,6 @@ class BotAutomatorMod(loader.Module):
 
             delay = float(self.config["delay"])
 
-            # Пока не нажали все кнопки по списку (например, сначала "5", потом "Запустить")
             while self.running and self._btn_index < len(target_buttons):
                 msg = self._last_bot_msg
                 if not msg:
@@ -319,7 +366,6 @@ class BotAutomatorMod(loader.Module):
                 current_target = target_buttons[self._btn_index]
                 btn = self._find_button(msg, current_target)
 
-                # Если нужной по очереди кнопки в текущем сообщении нет — ждем нового сообщения от бота
                 if not btn:
                     break
 
@@ -327,7 +373,6 @@ class BotAutomatorMod(loader.Module):
                 if not self.running:
                     return
 
-                # Перепроверяем кнопку в самом свежем сообщении (на случай если бот его обновил)
                 if self._last_bot_msg:
                     fresh_btn = self._find_button(self._last_bot_msg, current_target)
                     if fresh_btn:
@@ -338,10 +383,8 @@ class BotAutomatorMod(loader.Module):
                 except Exception as e:
                     logger.debug(f"[BotAutomator] Ошибка клика по '{current_target}': {e}")
 
-                # Переходим к следующей кнопке в списке (например, от "5" к "Запустить")
                 self._btn_index += 1
 
-            # Если прошли все кнопки из конфига — даем сигнал отправлять следующее сообщение
             if self._btn_index >= len(target_buttons):
                 self.sub_step_done.set()
 
