@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 @loader.tds
 class BotAutomatorMod(loader.Module):
-    """Пошаговая цикличная автоматизация действий и кнопок в ботах + автоочистка сообщений"""
+    """Пошаговая цикличная автоматизация действий и кнопок в ботах + безопасная автоочистка"""
 
     strings = {
         "name": "BotAutomator",
@@ -23,7 +23,7 @@ class BotAutomatorMod(loader.Module):
         "cfg_trigger": "Текст от бота о полном завершении (перезапуск цикла)",
         "cfg_delay": "Задержка между нажатиями кнопок (в секундах)",
         "cfg_step_delay": "Задержка перед отправкой 2-го сообщения и новым кругом (в секундах)",
-        "cfg_cleanup_enabled": "Включить автоматическое удаление свежих сообщений (< 10 часов)",
+        "cfg_cleanup_enabled": "Включить автоматическое удаление сообщений (от 15 минут до 10 часов назад)",
         "no_bot": "❌ <b>Целевой бот не настроен в конфиге!</b> Используй <code>.config BotAutomator</code>",
         "no_text": "❌ <b>Текст для отправки не задан!</b> Укажи его через <code>.btext &lt;текст&gt;</code> или сразу <code>.bstart &lt;текст&gt;</code>",
         "text_set": "✅ <b>Текст для цикла сохранен:</b>\n<code>{}</code>",
@@ -34,7 +34,7 @@ class BotAutomatorMod(loader.Module):
             "💬 <b>Текст (по 2 подхода):</b> <code>{}</code>\n"
             "🔘 <b>Очередь кнопок:</b> <code>{}</code>\n"
             "🎯 <b>Триггер нового круга:</b> <code>{}</code>\n"
-            "🧹 <b>Автоочистка (<10ч, раз в час):</b> <code>{}</code>"
+            "🧹 <b>Безопасная автоочистка (15м - 10ч):</b> <code>{}</code>"
         ),
         "stopped": "🛑 <b>Автоматизация остановлена.</b>",
         "not_running": "ℹ️ <b>Автоматизация сейчас не работает.</b>",
@@ -266,30 +266,27 @@ class BotAutomatorMod(loader.Module):
             self.running = False
 
     async def _cleanup_loop(self):
-        """Фоновая задача: удаляет сообщения моложе 10 часов каждый 1 час"""
+        """Безопасная автоочистка: удаляет сообщения в диапазоне от 15 минут до 10 часов назад"""
         try:
-            # Небольшая пауза при старте, чтобы не спамить запросами сразу
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
             while self.running:
                 if self.target_id:
                     try:
                         now = datetime.now(timezone.utc)
-                        threshold = now - timedelta(hours=10)
+                        # Верхняя граница: всё, что старше 10 часов — оставляем
+                        old_threshold = now - timedelta(hours=10)
+                        # Нижняя граница: всё, что новее 15 минут — НЕ ТРОГАЕМ (чтобы не удалять свежий цикл)
+                        fresh_threshold = now - timedelta(minutes=15)
+                        
                         messages_to_delete = []
 
                         async for msg in self._client.iter_messages(self.target_id, limit=100):
                             if msg.date:
-                                # Если дата сообщения позже порога (т.е. оно создано менее 10 часов назад)
-                                if msg.date > threshold:
+                                # Удаляем только если сообщение старше 15 минут, но новее 10 часов
+                                if old_threshold < msg.date < fresh_threshold:
                                     messages_to_delete.append(msg.id)
-                                else:
-                                    # Так как итератор идет от новых к старым, как только встретили сообщение старше 10 часов,
-                                    # все следующие будут еще старше. Но проверим и более старые на всякий случай или остановим?
-                                    # Оставим проверку всех в пределах лимита на случай разброса, либо просто фильтруем.
-                                    pass
 
                         if messages_to_delete:
-                            # Удаляем пачками по 100 штук (Telegram лимит)
                             for i in range(0, len(messages_to_delete), 100):
                                 chunk = messages_to_delete[i:i+100]
                                 await self._client.delete_messages(self.target_id, chunk)
@@ -297,7 +294,7 @@ class BotAutomatorMod(loader.Module):
                     except Exception as e:
                         logger.debug(f"[BotAutomator] Ошибка автоочистки: {e}")
 
-                # Ждем ровно 1 час перед следующей чисткой
+                # Проверка каждый 1 час
                 await asyncio.sleep(3600)
         except asyncio.CancelledError:
             pass
