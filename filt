@@ -27,7 +27,7 @@ class BotAutomatorMod(loader.Module):
         "already_running": "⚠️ <b>Цикл уже запущен!</b> Останови его через <code>.bstop</code>",
         "started": (
             "🚀 <b>Автоматизация запущена!</b>\n"
-            "🤖 <b>Бот:</b> <code>{}</code>\n"
+            "🤖 <b>Бот:</b> <code>{}</code> (ID: <code>{}</code>)\n"
             "💬 <b>Текст (x2):</b> <code>{}</code>\n"
             "🔘 <b>Кнопки:</b> <code>{}</code>\n"
             "🎯 <b>Триггер повтора:</b> <code>{}</code>"
@@ -75,8 +75,6 @@ class BotAutomatorMod(loader.Module):
         self._db = db
         self.running = False
 
-        # Регистрируем обработчик еще и на редактирование сообщений,
-        # так как боты часто меняют текст и кнопки в одном и том же сообщении
         self._client.add_event_handler(
             self._on_message_edited,
             events.MessageEdited(incoming=True),
@@ -98,13 +96,18 @@ class BotAutomatorMod(loader.Module):
         if not args:
             current = self.get("spam_text", "")
             if current:
-                await utils.answer(message, self.strings["text_set"].format(utils.escape_html(current)))
+                await utils.answer(
+                    message,
+                    self.strings["text_set"].format(utils.escape_html(current)),
+                )
             else:
                 await utils.answer(message, self.strings["no_text"])
             return
 
         self.set("spam_text", args)
-        await utils.answer(message, self.strings["text_set"].format(utils.escape_html(args)))
+        await utils.answer(
+            message, self.strings["text_set"].format(utils.escape_html(args))
+        )
 
     @loader.command()
     async def bstart(self, message: Message):
@@ -122,30 +125,47 @@ class BotAutomatorMod(loader.Module):
             await utils.answer(message, self.strings["no_text"])
             return
 
-        bot_identifier = self.config["target_bot"].strip()
-        if not bot_identifier:
+        raw_bot = str(self.config["target_bot"]).strip()
+        if not raw_bot:
             await utils.answer(message, self.strings["no_bot"])
             return
 
+        # Очищаем юзернейм на случай если ввели ссылку t.me/bot
+        clean_bot = (
+            raw_bot.replace("https://", "")
+            .replace("http://", "")
+            .replace("t.me/", "")
+            .strip("/")
+        )
+
         try:
-            if bot_identifier.lstrip("-").isdigit():
-                entity = await self._client.get_entity(int(bot_identifier))
+            if clean_bot.lstrip("-").isdigit():
+                entity = await self._client.get_entity(int(clean_bot))
             else:
-                entity = await self._client.get_entity(bot_identifier)
-            self.target_id = utils.get_chat_id(entity)
+                entity = await self._client.get_entity(clean_bot)
+            # Берем чистый ID напрямую из entity без багованного utils.get_chat_id
+            self.target_id = entity.id
         except Exception as e:
-            await utils.answer(message, self.strings["bot_error"].format(utils.escape_html(str(e))))
+            await utils.answer(
+                message,
+                self.strings["bot_error"].format(utils.escape_html(str(e))),
+            )
             return
 
         self.running = True
         self.done_event.clear()
         self.loop_task = asyncio.create_task(self._runner_loop())
 
-        buttons_str = ", ".join(self.config["buttons"]) if self.config["buttons"] else "Нет"
+        buttons_str = (
+            ", ".join(self.config["buttons"])
+            if self.config["buttons"]
+            else "Нет"
+        )
         await utils.answer(
             message,
             self.strings["started"].format(
-                utils.escape_html(bot_identifier),
+                utils.escape_html(raw_bot),
+                self.target_id,
                 utils.escape_html(spam_text),
                 utils.escape_html(buttons_str),
                 utils.escape_html(self.config["done_trigger"]),
@@ -173,7 +193,7 @@ class BotAutomatorMod(loader.Module):
             while self.running:
                 self.done_event.clear()
                 spam_text = self.get("spam_text", "")
-                delay = self.config["delay"]
+                delay = float(self.config["delay"])
 
                 # Отправляем текст 2 раза подряд
                 for _ in range(2):
@@ -182,13 +202,12 @@ class BotAutomatorMod(loader.Module):
                     await self._client.send_message(self.target_id, spam_text)
                     await asyncio.sleep(delay)
 
-                # Ждем, пока бот пришлет сообщение с текстом-триггером завершения
+                # Ждем, пока бот пришлет или отредактирует сообщение с триггером
                 await self.done_event.wait()
 
                 if not self.running:
                     return
 
-                # Небольшая пауза перед началом нового круга
                 await asyncio.sleep(delay)
         except asyncio.CancelledError:
             pass
@@ -201,11 +220,17 @@ class BotAutomatorMod(loader.Module):
         if not self.running or not self.target_id:
             return
 
-        if utils.get_chat_id(message) != self.target_id:
+        if not isinstance(message, Message):
             return
 
-        text = message.raw_text or ""
-        trigger = self.config["done_trigger"]
+        # Проверяем ID чата/бота напрямую через свойства Telethon
+        chat_id = getattr(message, "chat_id", None)
+        sender_id = getattr(message, "sender_id", None)
+        if chat_id != self.target_id and sender_id != self.target_id:
+            return
+
+        text = getattr(message, "raw_text", "") or ""
+        trigger = str(self.config["done_trigger"]).strip()
 
         # 1. Если бот написал финальный триггер (например, "✅ Готово")
         if trigger and trigger.lower() in text.lower():
@@ -213,24 +238,32 @@ class BotAutomatorMod(loader.Module):
             return
 
         # 2. Если в сообщении есть кнопки — ищем совпадения из конфига
-        if message.buttons:
+        if getattr(message, "buttons", None):
             async with self._click_lock:
-                target_buttons = [b.strip().lower() for b in self.config["buttons"] if b.strip()]
+                target_buttons = [
+                    str(b).strip().lower()
+                    for b in self.config["buttons"]
+                    if str(b).strip()
+                ]
                 if not target_buttons:
                     return
 
                 for row in message.buttons:
                     for btn in row:
-                        btn_text = (btn.text or "").strip().lower()
-                        # Проверяем точное совпадение или вхождение текста кнопки
-                        if any(tb == btn_text or tb in btn_text for tb in target_buttons):
-                            await asyncio.sleep(self.config["delay"])
+                        btn_text = (getattr(btn, "text", "") or "").strip().lower()
+                        if any(
+                            tb == btn_text or tb in btn_text
+                            for tb in target_buttons
+                        ):
+                            await asyncio.sleep(float(self.config["delay"]))
                             if not self.running:
                                 return
                             try:
                                 await btn.click()
                             except Exception as e:
-                                logger.debug(f"[BotAutomator] Не удалось нажать кнопку: {e}")
+                                logger.debug(
+                                    f"[BotAutomator] Не удалось нажать кнопку: {e}"
+                                )
                             return
 
     @loader.watcher("in")
@@ -238,4 +271,5 @@ class BotAutomatorMod(loader.Module):
         await self._handle_bot_response(message)
 
     async def _on_message_edited(self, event):
-        await self._handle_bot_response(event.message)
+        if getattr(event, "message", None):
+            await self._handle_bot_response(event.message)
