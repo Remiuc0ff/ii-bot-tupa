@@ -1,0 +1,241 @@
+# meta developer: @remiuc
+# scope: hikka_only
+# scope: hikka_min 1.3.0
+
+import asyncio
+import logging
+from telethon import events
+from telethon.tl.types import Message
+from .. import loader, utils
+
+logger = logging.getLogger(__name__)
+
+
+@loader.tds
+class BotAutomatorMod(loader.Module):
+    """Цикличная автоматизация действий и нажатия кнопок в ботах"""
+
+    strings = {
+        "name": "BotAutomator",
+        "cfg_bot": "Юзернейм или ID целевого бота (например, @example_bot)",
+        "cfg_buttons": "Список текстов инлайн-кнопок, на которые нужно нажимать",
+        "cfg_trigger": "Текст от бота, сигнализирующий о завершении цикла",
+        "cfg_delay": "Задержка между отправкой сообщений и кликами (в секундах)",
+        "no_bot": "❌ <b>Целевой бот не настроен в конфиге!</b> Используй <code>.config BotAutomator</code>",
+        "no_text": "❌ <b>Текст для отправки не задан!</b> Укажи его через <code>.btext &lt;текст&gt;</code> или сразу <code>.bstart &lt;текст&gt;</code>",
+        "text_set": "✅ <b>Текст для цикла сохранен:</b>\n<code>{}</code>",
+        "already_running": "⚠️ <b>Цикл уже запущен!</b> Останови его через <code>.bstop</code>",
+        "started": (
+            "🚀 <b>Автоматизация запущена!</b>\n"
+            "🤖 <b>Бот:</b> <code>{}</code>\n"
+            "💬 <b>Текст (x2):</b> <code>{}</code>\n"
+            "🔘 <b>Кнопки:</b> <code>{}</code>\n"
+            "🎯 <b>Триггер повтора:</b> <code>{}</code>"
+        ),
+        "stopped": "🛑 <b>Автоматизация остановлена.</b>",
+        "not_running": "ℹ️ <b>Автоматизация сейчас не работает.</b>",
+        "bot_error": "❌ <b>Не удалось найти бота:</b> <code>{}</code>",
+    }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "target_bot",
+                "",
+                lambda: self.strings["cfg_bot"],
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "buttons",
+                ["Подтвердить", "Далее"],
+                lambda: self.strings["cfg_buttons"],
+                validator=loader.validators.Series(loader.validators.String()),
+            ),
+            loader.ConfigValue(
+                "done_trigger",
+                "✅ Готово",
+                lambda: self.strings["cfg_trigger"],
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "delay",
+                1.5,
+                lambda: self.strings["cfg_delay"],
+                validator=loader.validators.Float(minimum=0.3),
+            ),
+        )
+        self.running = False
+        self.target_id = None
+        self.loop_task = None
+        self.done_event = asyncio.Event()
+        self._click_lock = asyncio.Lock()
+
+    async def client_ready(self, client, db):
+        self._client = client
+        self._db = db
+        self.running = False
+
+        # Регистрируем обработчик еще и на редактирование сообщений,
+        # так как боты часто меняют текст и кнопки в одном и том же сообщении
+        self._client.add_event_handler(
+            self._on_message_edited,
+            events.MessageEdited(incoming=True),
+        )
+
+    async def on_unload(self):
+        self.running = False
+        if self.loop_task:
+            self.loop_task.cancel()
+        self._client.remove_event_handler(
+            self._on_message_edited,
+            events.MessageEdited(incoming=True),
+        )
+
+    @loader.command()
+    async def btext(self, message: Message):
+        """<текст> — Задать текст, который будет отправляться боту 2 раза"""
+        args = utils.get_args_raw(message)
+        if not args:
+            current = self.get("spam_text", "")
+            if current:
+                await utils.answer(message, self.strings["text_set"].format(utils.escape_html(current)))
+            else:
+                await utils.answer(message, self.strings["no_text"])
+            return
+
+        self.set("spam_text", args)
+        await utils.answer(message, self.strings["text_set"].format(utils.escape_html(args)))
+
+    @loader.command()
+    async def bstart(self, message: Message):
+        """[текст] — Запустить цикл отправки и нажатия кнопок в боте"""
+        if self.running:
+            await utils.answer(message, self.strings["already_running"])
+            return
+
+        args = utils.get_args_raw(message)
+        if args:
+            self.set("spam_text", args)
+
+        spam_text = self.get("spam_text", "")
+        if not spam_text:
+            await utils.answer(message, self.strings["no_text"])
+            return
+
+        bot_identifier = self.config["target_bot"].strip()
+        if not bot_identifier:
+            await utils.answer(message, self.strings["no_bot"])
+            return
+
+        try:
+            if bot_identifier.lstrip("-").isdigit():
+                entity = await self._client.get_entity(int(bot_identifier))
+            else:
+                entity = await self._client.get_entity(bot_identifier)
+            self.target_id = utils.get_chat_id(entity)
+        except Exception as e:
+            await utils.answer(message, self.strings["bot_error"].format(utils.escape_html(str(e))))
+            return
+
+        self.running = True
+        self.done_event.clear()
+        self.loop_task = asyncio.create_task(self._runner_loop())
+
+        buttons_str = ", ".join(self.config["buttons"]) if self.config["buttons"] else "Нет"
+        await utils.answer(
+            message,
+            self.strings["started"].format(
+                utils.escape_html(bot_identifier),
+                utils.escape_html(spam_text),
+                utils.escape_html(buttons_str),
+                utils.escape_html(self.config["done_trigger"]),
+            ),
+        )
+
+    @loader.command()
+    async def bstop(self, message: Message):
+        """— Остановить цикл автоматизации"""
+        if not self.running:
+            await utils.answer(message, self.strings["not_running"])
+            return
+
+        self.running = False
+        self.done_event.set()
+        if self.loop_task:
+            self.loop_task.cancel()
+            self.loop_task = None
+
+        await utils.answer(message, self.strings["stopped"])
+
+    async def _runner_loop(self):
+        """Основной цикл отправки текста 2 раза и ожидания триггера"""
+        try:
+            while self.running:
+                self.done_event.clear()
+                spam_text = self.get("spam_text", "")
+                delay = self.config["delay"]
+
+                # Отправляем текст 2 раза подряд
+                for _ in range(2):
+                    if not self.running:
+                        return
+                    await self._client.send_message(self.target_id, spam_text)
+                    await asyncio.sleep(delay)
+
+                # Ждем, пока бот пришлет сообщение с текстом-триггером завершения
+                await self.done_event.wait()
+
+                if not self.running:
+                    return
+
+                # Небольшая пауза перед началом нового круга
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[BotAutomator] Ошибка в цикле: {e}")
+            self.running = False
+
+    async def _handle_bot_response(self, message: Message):
+        """Проверка сообщений от бота на триггер и нужные кнопки"""
+        if not self.running or not self.target_id:
+            return
+
+        if utils.get_chat_id(message) != self.target_id:
+            return
+
+        text = message.raw_text or ""
+        trigger = self.config["done_trigger"]
+
+        # 1. Если бот написал финальный триггер (например, "✅ Готово")
+        if trigger and trigger.lower() in text.lower():
+            self.done_event.set()
+            return
+
+        # 2. Если в сообщении есть кнопки — ищем совпадения из конфига
+        if message.buttons:
+            async with self._click_lock:
+                target_buttons = [b.strip().lower() for b in self.config["buttons"] if b.strip()]
+                if not target_buttons:
+                    return
+
+                for row in message.buttons:
+                    for btn in row:
+                        btn_text = (btn.text or "").strip().lower()
+                        # Проверяем точное совпадение или вхождение текста кнопки
+                        if any(tb == btn_text or tb in btn_text for tb in target_buttons):
+                            await asyncio.sleep(self.config["delay"])
+                            if not self.running:
+                                return
+                            try:
+                                await btn.click()
+                            except Exception as e:
+                                logger.debug(f"[BotAutomator] Не удалось нажать кнопку: {e}")
+                            return
+
+    @loader.watcher("in")
+    async def watcher(self, message: Message):
+        await self._handle_bot_response(message)
+
+    async def _on_message_edited(self, event):
+        await self._handle_bot_response(event.message)
