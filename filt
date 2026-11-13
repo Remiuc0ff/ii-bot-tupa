@@ -13,14 +13,15 @@ logger = logging.getLogger(__name__)
 
 @loader.tds
 class BotAutomatorMod(loader.Module):
-    """Цикличная автоматизация действий и нажатия кнопок в ботах"""
+    """Пошаговая цикличная автоматизация действий и кнопок в ботах"""
 
     strings = {
         "name": "BotAutomator",
         "cfg_bot": "Юзернейм или ID целевого бота (например, @example_bot)",
-        "cfg_buttons": "Список текстов инлайн-кнопок, на которые нужно нажимать",
-        "cfg_trigger": "Текст от бота, сигнализирующий о завершении цикла",
-        "cfg_delay": "Задержка между отправкой сообщений и кликами (в секундах)",
+        "cfg_buttons": "Список текстов кнопок по порядку нажатия",
+        "cfg_trigger": "Текст от бота о полном завершении (перезапуск цикла)",
+        "cfg_delay": "Задержка между нажатиями кнопок (в секундах)",
+        "cfg_step_delay": "Задержка перед отправкой 2-го сообщения и новым кругом (в секундах)",
         "no_bot": "❌ <b>Целевой бот не настроен в конфиге!</b> Используй <code>.config BotAutomator</code>",
         "no_text": "❌ <b>Текст для отправки не задан!</b> Укажи его через <code>.btext &lt;текст&gt;</code> или сразу <code>.bstart &lt;текст&gt;</code>",
         "text_set": "✅ <b>Текст для цикла сохранен:</b>\n<code>{}</code>",
@@ -28,9 +29,9 @@ class BotAutomatorMod(loader.Module):
         "started": (
             "🚀 <b>Автоматизация запущена!</b>\n"
             "🤖 <b>Бот:</b> <code>{}</code> (ID: <code>{}</code>)\n"
-            "💬 <b>Текст (x2):</b> <code>{}</code>\n"
+            "💬 <b>Текст (по 2 подхода):</b> <code>{}</code>\n"
             "🔘 <b>Кнопки:</b> <code>{}</code>\n"
-            "🎯 <b>Триггер повтора:</b> <code>{}</code>"
+            "🎯 <b>Триггер нового круга:</b> <code>{}</code>"
         ),
         "stopped": "🛑 <b>Автоматизация остановлена.</b>",
         "not_running": "ℹ️ <b>Автоматизация сейчас не работает.</b>",
@@ -63,12 +64,20 @@ class BotAutomatorMod(loader.Module):
                 lambda: self.strings["cfg_delay"],
                 validator=loader.validators.Float(minimum=0.3),
             ),
+            loader.ConfigValue(
+                "step_delay",
+                3.0,
+                lambda: self.strings["cfg_step_delay"],
+                validator=loader.validators.Float(minimum=0.5),
+            ),
         )
         self.running = False
         self.target_id = None
         self.loop_task = None
-        self.done_event = asyncio.Event()
+        self.sub_step_done = asyncio.Event()
+        self.cycle_done = asyncio.Event()
         self._click_lock = asyncio.Lock()
+        self._clicked_in_step = 0
 
     async def client_ready(self, client, db):
         self._client = client
@@ -91,7 +100,7 @@ class BotAutomatorMod(loader.Module):
 
     @loader.command()
     async def btext(self, message: Message):
-        """<текст> — Задать текст, который будет отправляться боту 2 раза"""
+        """<текст> — Задать текст для отправки боту"""
         args = utils.get_args_raw(message)
         if not args:
             current = self.get("spam_text", "")
@@ -130,7 +139,6 @@ class BotAutomatorMod(loader.Module):
             await utils.answer(message, self.strings["no_bot"])
             return
 
-        # Очищаем юзернейм на случай если ввели ссылку t.me/bot
         clean_bot = (
             raw_bot.replace("https://", "")
             .replace("http://", "")
@@ -143,7 +151,6 @@ class BotAutomatorMod(loader.Module):
                 entity = await self._client.get_entity(int(clean_bot))
             else:
                 entity = await self._client.get_entity(clean_bot)
-            # Берем чистый ID напрямую из entity без багованного utils.get_chat_id
             self.target_id = entity.id
         except Exception as e:
             await utils.answer(
@@ -153,7 +160,8 @@ class BotAutomatorMod(loader.Module):
             return
 
         self.running = True
-        self.done_event.clear()
+        self.sub_step_done.clear()
+        self.cycle_done.clear()
         self.loop_task = asyncio.create_task(self._runner_loop())
 
         buttons_str = (
@@ -180,7 +188,8 @@ class BotAutomatorMod(loader.Module):
             return
 
         self.running = False
-        self.done_event.set()
+        self.sub_step_done.set()
+        self.cycle_done.set()
         if self.loop_task:
             self.loop_task.cancel()
             self.loop_task = None
@@ -188,27 +197,60 @@ class BotAutomatorMod(loader.Module):
         await utils.answer(message, self.strings["stopped"])
 
     async def _runner_loop(self):
-        """Основной цикл отправки текста 2 раза и ожидания триггера"""
+        """
+        Алгоритм:
+        1. Отправляет 1-е сообщение -> нажимает кнопки из конфига.
+        2. Ждет step_delay -> отправляет 2-е сообщение -> нажимает кнопки из конфига (не дожидаясь 'Готово').
+        3. Ждет финального текста done_trigger ('✅ Готово') от бота -> повторяет всё с шага 1.
+        """
         try:
             while self.running:
-                self.done_event.clear()
+                self.cycle_done.clear()
                 spam_text = self.get("spam_text", "")
-                delay = float(self.config["delay"])
+                step_delay = float(self.config["step_delay"])
+                target_buttons = [
+                    str(b).strip()
+                    for b in self.config["buttons"]
+                    if str(b).strip()
+                ]
 
-                # Отправляем текст 2 раза подряд
-                for _ in range(2):
+                # Выполняем 2 подхода подряд (сообщение -> кнопки -> сообщение -> кнопки)
+                for step in range(2):
                     if not self.running:
                         return
-                    await self._client.send_message(self.target_id, spam_text)
-                    await asyncio.sleep(delay)
 
-                # Ждем, пока бот пришлет или отредактирует сообщение с триггером
-                await self.done_event.wait()
+                    self.sub_step_done.clear()
+                    self._clicked_in_step = 0
+
+                    # Отправляем 1 сообщение
+                    await self._client.send_message(self.target_id, spam_text)
+
+                    # Если в конфиге заданы кнопки, ждем пока модуль нажмет их для этого сообщения
+                    if target_buttons:
+                        try:
+                            # Ждем нажатия всех указанных кнопок (таймаут 30 сек на случай, если бот завис)
+                            await asyncio.wait_for(
+                                self.sub_step_done.wait(), timeout=30.0
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+
+                    if not self.running:
+                        return
+
+                    # Задержка после 1-го подхода перед отправкой 2-го сообщения
+                    if step == 0:
+                        await asyncio.sleep(step_delay)
+
+                # Оба сообщения отправлены и кнопки нажаты — теперь ждем финальный триггер ("✅ Готово")
+                await self.cycle_done.wait()
 
                 if not self.running:
                     return
 
-                await asyncio.sleep(delay)
+                # Пауза перед запуском нового двойного круга
+                await asyncio.sleep(step_delay)
+
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -216,14 +258,13 @@ class BotAutomatorMod(loader.Module):
             self.running = False
 
     async def _handle_bot_response(self, message: Message):
-        """Проверка сообщений от бота на триггер и нужные кнопки"""
+        """Обработка ответов бота: проверка триггера и клики по кнопкам"""
         if not self.running or not self.target_id:
             return
 
         if not isinstance(message, Message):
             return
 
-        # Проверяем ID чата/бота напрямую через свойства Telethon
         chat_id = getattr(message, "chat_id", None)
         sender_id = getattr(message, "sender_id", None)
         if chat_id != self.target_id and sender_id != self.target_id:
@@ -232,12 +273,11 @@ class BotAutomatorMod(loader.Module):
         text = getattr(message, "raw_text", "") or ""
         trigger = str(self.config["done_trigger"]).strip()
 
-        # 1. Если бот написал финальный триггер (например, "✅ Готово")
+        # 1. Проверяем, прислал ли бот финальный триггер ("✅ Готово")
         if trigger and trigger.lower() in text.lower():
-            self.done_event.set()
-            return
+            self.cycle_done.set()
 
-        # 2. Если в сообщении есть кнопки — ищем совпадения из конфига
+        # 2. Если в сообщении есть кнопки — нажимаем нужные
         if getattr(message, "buttons", None):
             async with self._click_lock:
                 target_buttons = [
@@ -246,7 +286,10 @@ class BotAutomatorMod(loader.Module):
                     if str(b).strip()
                 ]
                 if not target_buttons:
+                    self.sub_step_done.set()
                     return
+
+                delay = float(self.config["delay"])
 
                 for row in message.buttons:
                     for btn in row:
@@ -255,11 +298,15 @@ class BotAutomatorMod(loader.Module):
                             tb == btn_text or tb in btn_text
                             for tb in target_buttons
                         ):
-                            await asyncio.sleep(float(self.config["delay"]))
+                            await asyncio.sleep(delay)
                             if not self.running:
                                 return
                             try:
                                 await btn.click()
+                                self._clicked_in_step += 1
+                                # Если нажали все кнопки из списка для одного подхода — пускаем 2-е сообщение
+                                if self._clicked_in_step >= len(target_buttons):
+                                    self.sub_step_done.set()
                             except Exception as e:
                                 logger.debug(
                                     f"[BotAutomator] Не удалось нажать кнопку: {e}"
