@@ -18,7 +18,7 @@ class BotAutomatorMod(loader.Module):
     strings = {
         "name": "BotAutomator",
         "cfg_bot": "Юзернейм или ID целевого бота (например, @example_bot)",
-        "cfg_buttons": "Список текстов кнопок по порядку нажатия",
+        "cfg_buttons": "Список текстов кнопок СТРОГО по порядку нажатия (например: 5, Запустить)",
         "cfg_trigger": "Текст от бота о полном завершении (перезапуск цикла)",
         "cfg_delay": "Задержка между нажатиями кнопок (в секундах)",
         "cfg_step_delay": "Задержка перед отправкой 2-го сообщения и новым кругом (в секундах)",
@@ -30,7 +30,7 @@ class BotAutomatorMod(loader.Module):
             "🚀 <b>Автоматизация запущена!</b>\n"
             "🤖 <b>Бот:</b> <code>{}</code> (ID: <code>{}</code>)\n"
             "💬 <b>Текст (по 2 подхода):</b> <code>{}</code>\n"
-            "🔘 <b>Кнопки:</b> <code>{}</code>\n"
+            "🔘 <b>Очередь кнопок:</b> <code>{}</code>\n"
             "🎯 <b>Триггер нового круга:</b> <code>{}</code>"
         ),
         "stopped": "🛑 <b>Автоматизация остановлена.</b>",
@@ -48,7 +48,7 @@ class BotAutomatorMod(loader.Module):
             ),
             loader.ConfigValue(
                 "buttons",
-                ["Подтвердить", "Далее"],
+                ["5", "Запустить"],
                 lambda: self.strings["cfg_buttons"],
                 validator=loader.validators.Series(loader.validators.String()),
             ),
@@ -77,7 +77,8 @@ class BotAutomatorMod(loader.Module):
         self.sub_step_done = asyncio.Event()
         self.cycle_done = asyncio.Event()
         self._click_lock = asyncio.Lock()
-        self._clicked_in_step = 0
+        self._btn_index = 0
+        self._last_bot_msg = None
 
     async def client_ready(self, client, db):
         self._client = client
@@ -165,7 +166,7 @@ class BotAutomatorMod(loader.Module):
         self.loop_task = asyncio.create_task(self._runner_loop())
 
         buttons_str = (
-            ", ".join(self.config["buttons"])
+            " ➔ ".join(self.config["buttons"])
             if self.config["buttons"]
             else "Нет"
         )
@@ -197,12 +198,6 @@ class BotAutomatorMod(loader.Module):
         await utils.answer(message, self.strings["stopped"])
 
     async def _runner_loop(self):
-        """
-        Алгоритм:
-        1. Отправляет 1-е сообщение -> нажимает кнопки из конфига.
-        2. Ждет step_delay -> отправляет 2-е сообщение -> нажимает кнопки из конфига (не дожидаясь 'Готово').
-        3. Ждет финального текста done_trigger ('✅ Готово') от бота -> повторяет всё с шага 1.
-        """
         try:
             while self.running:
                 self.cycle_done.clear()
@@ -214,23 +209,21 @@ class BotAutomatorMod(loader.Module):
                     if str(b).strip()
                 ]
 
-                # Выполняем 2 подхода подряд (сообщение -> кнопки -> сообщение -> кнопки)
+                # 2 подхода подряд: (сообщение -> все кнопки по очереди) x2
                 for step in range(2):
                     if not self.running:
                         return
 
                     self.sub_step_done.clear()
-                    self._clicked_in_step = 0
+                    self._btn_index = 0
+                    self._last_bot_msg = None
 
-                    # Отправляем 1 сообщение
                     await self._client.send_message(self.target_id, spam_text)
 
-                    # Если в конфиге заданы кнопки, ждем пока модуль нажмет их для этого сообщения
                     if target_buttons:
                         try:
-                            # Ждем нажатия всех указанных кнопок (таймаут 30 сек на случай, если бот завис)
                             await asyncio.wait_for(
-                                self.sub_step_done.wait(), timeout=30.0
+                                self.sub_step_done.wait(), timeout=40.0
                             )
                         except asyncio.TimeoutError:
                             pass
@@ -238,17 +231,15 @@ class BotAutomatorMod(loader.Module):
                     if not self.running:
                         return
 
-                    # Задержка после 1-го подхода перед отправкой 2-го сообщения
                     if step == 0:
                         await asyncio.sleep(step_delay)
 
-                # Оба сообщения отправлены и кнопки нажаты — теперь ждем финальный триггер ("✅ Готово")
+                # Ждем финальное сообщение "✅ Готово"
                 await self.cycle_done.wait()
 
                 if not self.running:
                     return
 
-                # Пауза перед запуском нового двойного круга
                 await asyncio.sleep(step_delay)
 
         except asyncio.CancelledError:
@@ -257,8 +248,30 @@ class BotAutomatorMod(loader.Module):
             logger.error(f"[BotAutomator] Ошибка в цикле: {e}")
             self.running = False
 
+    def _find_button(self, message: Message, target_text: str):
+        """Ищет кнопку в сообщении (сначала точное совпадение, затем частичное)"""
+        if not getattr(message, "buttons", None):
+            return None
+
+        target_lower = target_text.lower()
+
+        # 1. Ищем точное совпадение или совпадение с точкой "• 5"
+        for row in message.buttons:
+            for btn in row:
+                b_text = (getattr(btn, "text", "") or "").strip().lower()
+                if b_text == target_lower or b_text == f"• {target_lower}":
+                    return btn
+
+        # 2. Ищем вхождение (например, "Запустить" внутри "🚀 Запустить")
+        for row in message.buttons:
+            for btn in row:
+                b_text = (getattr(btn, "text", "") or "").strip().lower()
+                if target_lower in b_text:
+                    return btn
+
+        return None
+
     async def _handle_bot_response(self, message: Message):
-        """Обработка ответов бота: проверка триггера и клики по кнопкам"""
         if not self.running or not self.target_id:
             return
 
@@ -273,45 +286,64 @@ class BotAutomatorMod(loader.Module):
         text = getattr(message, "raw_text", "") or ""
         trigger = str(self.config["done_trigger"]).strip()
 
-        # 1. Проверяем, прислал ли бот финальный триггер ("✅ Готово")
+        # 1. Проверяем финальный триггер ("✅ Готово")
         if trigger and trigger.lower() in text.lower():
             self.cycle_done.set()
 
-        # 2. Если в сообщении есть кнопки — нажимаем нужные
+        # 2. Сохраняем актуальное сообщение с кнопками и запускаем последовательный кликер
         if getattr(message, "buttons", None):
-            async with self._click_lock:
-                target_buttons = [
-                    str(b).strip().lower()
-                    for b in self.config["buttons"]
-                    if str(b).strip()
-                ]
-                if not target_buttons:
-                    self.sub_step_done.set()
+            self._last_bot_msg = message
+            if not self._click_lock.locked():
+                asyncio.create_task(self._process_buttons_queue())
+
+    async def _process_buttons_queue(self):
+        """Последовательно нажимает кнопки из конфига в одном или нескольких сообщениях"""
+        async with self._click_lock:
+            target_buttons = [
+                str(b).strip()
+                for b in self.config["buttons"]
+                if str(b).strip()
+            ]
+            if not target_buttons:
+                self.sub_step_done.set()
+                return
+
+            delay = float(self.config["delay"])
+
+            # Пока не нажали все кнопки по списку (например, сначала "5", потом "Запустить")
+            while self.running and self._btn_index < len(target_buttons):
+                msg = self._last_bot_msg
+                if not msg:
+                    break
+
+                current_target = target_buttons[self._btn_index]
+                btn = self._find_button(msg, current_target)
+
+                # Если нужной по очереди кнопки в текущем сообщении нет — ждем нового сообщения от бота
+                if not btn:
+                    break
+
+                await asyncio.sleep(delay)
+                if not self.running:
                     return
 
-                delay = float(self.config["delay"])
+                # Перепроверяем кнопку в самом свежем сообщении (на случай если бот его обновил)
+                if self._last_bot_msg:
+                    fresh_btn = self._find_button(self._last_bot_msg, current_target)
+                    if fresh_btn:
+                        btn = fresh_btn
 
-                for row in message.buttons:
-                    for btn in row:
-                        btn_text = (getattr(btn, "text", "") or "").strip().lower()
-                        if any(
-                            tb == btn_text or tb in btn_text
-                            for tb in target_buttons
-                        ):
-                            await asyncio.sleep(delay)
-                            if not self.running:
-                                return
-                            try:
-                                await btn.click()
-                                self._clicked_in_step += 1
-                                # Если нажали все кнопки из списка для одного подхода — пускаем 2-е сообщение
-                                if self._clicked_in_step >= len(target_buttons):
-                                    self.sub_step_done.set()
-                            except Exception as e:
-                                logger.debug(
-                                    f"[BotAutomator] Не удалось нажать кнопку: {e}"
-                                )
-                            return
+                try:
+                    await btn.click()
+                except Exception as e:
+                    logger.debug(f"[BotAutomator] Ошибка клика по '{current_target}': {e}")
+
+                # Переходим к следующей кнопке в списке (например, от "5" к "Запустить")
+                self._btn_index += 1
+
+            # Если прошли все кнопки из конфига — даем сигнал отправлять следующее сообщение
+            if self._btn_index >= len(target_buttons):
+                self.sub_step_done.set()
 
     @loader.watcher("in")
     async def watcher(self, message: Message):
