@@ -61,6 +61,13 @@ class GeminiAIMod(loader.Module):
             ),
         )
 
+    def _safe_args_html(self, message, args_raw):
+        try:
+            return utils.get_args_html(message)
+        except Exception:
+            parts = (message.text or "").split(maxsplit=1)
+            return parts[1].strip() if len(parts) > 1 else utils.escape_html(args_raw)
+
     @loader.command(ru_doc="<запрос> — спросить у нейросети")
     async def ai(self, message):
         """<query> - ask Gemini"""
@@ -69,12 +76,12 @@ class GeminiAIMod(loader.Module):
             return await utils.answer(message, self.strings["no_key"])
 
         args_raw = utils.get_args_raw(message)
-        args_html = utils.get_args_html(message)
+        args_html = self._safe_args_html(message, args_raw)
         reply = await message.get_reply_message()
 
         if reply and reply.raw_text:
             prompt = f"{args_raw}\n\nКонтекст:\n{reply.raw_text}" if args_raw else reply.raw_text
-            display_q = args_html if args_html else utils.escape_html(reply.raw_text)
+            display_q = args_html if args_raw else (reply.text or utils.escape_html(reply.raw_text))
         elif args_raw:
             prompt = args_raw
             display_q = args_html
