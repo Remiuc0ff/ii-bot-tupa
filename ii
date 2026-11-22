@@ -4,7 +4,7 @@ from .. import loader, utils
 
 @loader.tds
 class GeminiAIMod(loader.Module):
-    """Краткие и живые ответы от Gemini с памятью и прем-эмодзи"""
+    """Краткие и живые ответы от Gemini с памятью, прем-эмодзи и автопереключением моделей"""
 
     strings = {
         "name": "GeminiAI",
@@ -26,8 +26,14 @@ class GeminiAIMod(loader.Module):
             ),
             loader.ConfigValue(
                 "model",
-                "gemini-flash-latest",
-                "Модель Gemini",
+                "gemini-2.5-flash",
+                "Основная модель Gemini",
+            ),
+            loader.ConfigValue(
+                "fallback_models",
+                ["gemini-2.5-flash-lite", "gemini-flash-latest", "gemini-3.8-flash"],
+                "Запасные модели (если основная перегружена)",
+                validator=loader.validators.Series(),
             ),
             loader.ConfigValue(
                 "emoji_question",
@@ -99,10 +105,6 @@ class GeminiAIMod(loader.Module):
         user_msg = {"role": "user", "parts": [{"text": prompt}]}
         contents = chat_history + [user_msg]
 
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.config['model']}:generateContent"
-        )
         headers = {
             "Content-Type": "application/json",
             "X-goog-api-key": api_key,
@@ -114,22 +116,37 @@ class GeminiAIMod(loader.Module):
             "contents": contents,
         }
 
+        models = list(dict.fromkeys([self.config["model"]] + list(self.config["fallback_models"])))
+        answer = None
+        last_err = "Неизвестная ошибка"
+
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url, headers=headers, json=payload, timeout=30
-                ) as resp:
-                    data = await resp.json()
-                    if resp.status != 200:
-                        err = data.get("error", {}).get("message", f"HTTP {resp.status}")
-                        return await utils.answer(
-                            message, self.strings["error"].format(utils.escape_html(err))
-                        )
+                for model_name in models:
+                    url = (
+                        f"https://generativelanguage.googleapis.com/v1beta/models/"
+                        f"{model_name}:generateContent"
+                    )
+                    async with session.post(
+                        url, headers=headers, json=payload, timeout=30
+                    ) as resp:
+                        data = await resp.json()
+                        if resp.status == 200:
+                            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            break
 
-                    answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        last_err = data.get("error", {}).get("message", f"HTTP {resp.status}")
+                        # Переключаемся только при перегрузке, лимите или недоступности модели
+                        if resp.status not in (404, 429, 500, 503):
+                            break
         except Exception as e:
             return await utils.answer(
                 message, self.strings["error"].format(utils.escape_html(str(e)))
+            )
+
+        if not answer:
+            return await utils.answer(
+                message, self.strings["error"].format(utils.escape_html(last_err))
             )
 
         if max_pairs > 0:
