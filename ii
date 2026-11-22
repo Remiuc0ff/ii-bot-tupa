@@ -1,0 +1,155 @@
+import aiohttp
+from .. import loader, utils
+
+
+@loader.tds
+class GeminiAIMod(loader.Module):
+    """Краткие и живые ответы от Gemini с памятью и прем-эмодзи"""
+
+    strings = {
+        "name": "GeminiAI",
+        "no_key": "❌ <b>Нет API-ключа.</b>\nУкажи его в <code>.config GeminiAI</code>",
+        "no_args": "❓ <b>Напиши запрос или ответь на сообщение.</b>",
+        "cleared": "🧹 <b>Контекст этого чата очищен.</b>",
+        "empty": "ℹ️ <b>В этом чате и так пусто.</b>",
+        "error": "❌ <b>Ошибка API:</b> <code>{}</code>",
+    }
+
+    def __init__(self):
+        self.history = {}
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "api_key",
+                "AQ.Ab8RN6JIUyb0LICLHDt5_AJp-MezJEdmB4kPywpjP62TBV9wiA",
+                "API-ключ от Google AI Studio",
+                validator=loader.validators.Hidden(),
+            ),
+            loader.ConfigValue(
+                "model",
+                "gemini-flash-latest",
+                "Модель Gemini",
+            ),
+            loader.ConfigValue(
+                "emoji_question",
+                "<emoji document_id=5467928559664242360>❓</emoji>",
+                "Прем-эмодзи для блока «Вопрос»",
+            ),
+            loader.ConfigValue(
+                "emoji_gemini",
+                "<emoji document_id=5325547803936572038>✨</emoji>",
+                "Прем-эмодзи для блока «Gemini»",
+            ),
+            loader.ConfigValue(
+                "emoji_thinking",
+                "<emoji document_id=5451646226975955576>⏳</emoji>",
+                "Прем-эмодзи во время генерации ответа",
+            ),
+            loader.ConfigValue(
+                "max_history",
+                10,
+                "Сколько последних пар (вопрос + ответ) помнить в чате (0 — без памяти)",
+                validator=loader.validators.Integer(minimum=0),
+            ),
+            loader.ConfigValue(
+                "system_prompt",
+                (
+                    "Отвечай максимально кратко, понятно и по делу. "
+                    "Пиши естественно, как обычный человек в переписке — "
+                    "без официоза, лишней воды и шаблонных фраз нейросетей."
+                ),
+                "Стиль общения нейросети",
+            ),
+        )
+
+    @loader.command(ru_doc="<запрос> — спросить у нейросети")
+    async def ai(self, message):
+        """<query> - ask Gemini"""
+        api_key = self.config["api_key"]
+        if not api_key:
+            return await utils.answer(message, self.strings["no_key"])
+
+        args_raw = utils.get_args_raw(message)
+        args_html = utils.get_args_html(message)
+        reply = await message.get_reply_message()
+
+        if reply and reply.raw_text:
+            prompt = f"{args_raw}\n\nКонтекст:\n{reply.raw_text}" if args_raw else reply.raw_text
+            display_q = args_html if args_html else utils.escape_html(reply.raw_text)
+        elif args_raw:
+            prompt = args_raw
+            display_q = args_html
+        else:
+            return await utils.answer(message, self.strings["no_args"])
+
+        await utils.answer(
+            message, f"{self.config['emoji_thinking']} <i>Думаю...</i>"
+        )
+
+        chat_id = utils.get_chat_id(message)
+        max_pairs = self.config["max_history"]
+        chat_history = self.history.get(chat_id, []) if max_pairs > 0 else []
+
+        user_msg = {"role": "user", "parts": [{"text": prompt}]}
+        contents = chat_history + [user_msg]
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.config['model']}:generateContent"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "X-goog-api-key": api_key,
+        }
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": self.config["system_prompt"]}]
+            },
+            "contents": contents,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, headers=headers, json=payload, timeout=30
+                ) as resp:
+                    data = await resp.json()
+                    if resp.status != 200:
+                        err = data.get("error", {}).get("message", f"HTTP {resp.status}")
+                        return await utils.answer(
+                            message, self.strings["error"].format(utils.escape_html(err))
+                        )
+
+                    answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e:
+            return await utils.answer(
+                message, self.strings["error"].format(utils.escape_html(str(e)))
+            )
+
+        if max_pairs > 0:
+            model_msg = {"role": "model", "parts": [{"text": answer}]}
+            updated_history = contents + [model_msg]
+            self.history[chat_id] = updated_history[-(max_pairs * 2):]
+
+        if len(display_q) > 800:
+            display_q = display_q[:800] + "..."
+        if len(answer) > 3000:
+            answer = answer[:3000] + "..."
+
+        result = (
+            f"{self.config['emoji_question']} <b>Вопрос:</b>\n"
+            f"<blockquote>{display_q}</blockquote>\n\n"
+            f"{self.config['emoji_gemini']} <b>Gemini:</b>\n"
+            f"<blockquote>{utils.escape_html(answer)}</blockquote>"
+        )
+
+        await utils.answer(message, result)
+
+    @loader.command(ru_doc="— очистить память диалога в текущем чате")
+    async def aiclear(self, message):
+        """- clear conversation history in current chat"""
+        chat_id = utils.get_chat_id(message)
+        if chat_id in self.history:
+            del self.history[chat_id]
+            await utils.answer(message, self.strings["cleared"])
+        else:
+            await utils.answer(message, self.strings["empty"])
